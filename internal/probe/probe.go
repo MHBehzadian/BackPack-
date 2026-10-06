@@ -136,3 +136,60 @@ func handleEcho(c net.Conn) {
 	}
 	c.Write(line)
 }
+
+// Member is one named tunnel check inside a Group.
+type Member struct {
+	Name string
+	P    Prober
+}
+
+// Group checks every tunnel of one server at once.
+type Group struct {
+	Members []Member
+	// RequireAll fails the server when any member fails; otherwise only when all do.
+	RequireAll bool
+}
+
+// Run probes all members in parallel. It returns the server-level result and
+// each member's own result, in order.
+func (g Group) Run(ctx context.Context) (Result, []Result) {
+	each := make([]Result, len(g.Members))
+	done := make(chan struct{}, len(g.Members))
+	for i, m := range g.Members {
+		go func() {
+			each[i] = m.P.Probe(ctx)
+			done <- struct{}{}
+		}()
+	}
+	for range g.Members {
+		<-done
+	}
+	var failed []string
+	var rtt time.Duration
+	okCount := 0
+	for i, r := range each {
+		if r.OK {
+			okCount++
+			rtt = max(rtt, r.RTT)
+			continue
+		}
+		msg := "failed"
+		if r.Err != nil {
+			msg = r.Err.Error()
+		}
+		if len(g.Members) == 1 {
+			failed = append(failed, msg)
+		} else {
+			failed = append(failed, g.Members[i].Name+": "+msg)
+		}
+	}
+	ok := okCount == len(each)
+	if !g.RequireAll {
+		ok = okCount > 0
+	}
+	res := Result{OK: ok, RTT: rtt}
+	if !ok {
+		res.Err = errors.New(strings.Join(failed, "; "))
+	}
+	return res, each
+}

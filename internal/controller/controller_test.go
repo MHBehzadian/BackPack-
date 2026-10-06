@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -17,9 +18,9 @@ import (
 const cfgJSON = `{
   "check_interval": "10s",
   "servers": [
-    {"name": "iran1", "ip": "10.0.0.1", "probe": {"port": 59999}},
+    {"name": "iran1", "ip": "10.0.0.1", "tunnels": [{"name": "main", "port": 59999}, {"name": "panel", "port": 59997}]},
     {"name": "iran2", "ip": "10.0.0.2", "probe": {"port": 59999}}
-  ],
+  ],%s
   "failover": {"fail_threshold": 3, "recover_threshold": 3, "flap_window": "5m", "flap_max_drops": 3, "failback_after": "10m", "min_hold": "3m"},
   "arvan": {"api_key": "k", "domain": "example.com", "record": "tun"},
   "dns_verify": {"resolvers": ["r1", "r2"], "interval": "10s"}
@@ -69,7 +70,11 @@ type harness struct {
 }
 
 func newHarness(t *testing.T, recordIP string) *harness {
-	cfg, err := config.Parse([]byte(cfgJSON))
+	return newHarnessWith(t, recordIP, "", state.State{})
+}
+
+func newHarnessWith(t *testing.T, recordIP, extra string, st state.State) *harness {
+	cfg, err := config.Parse([]byte(fmt.Sprintf(cfgJSON, extra)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,9 +87,10 @@ func newHarness(t *testing.T, recordIP string) *harness {
 		Lookup: func(_ context.Context, r, _ string) ([]string, error) {
 			return []string{h.resIP[r]}, nil
 		},
-		Probers: []probe.Prober{nil, nil},
-		Now:     func() time.Time { return h.now },
-		Save:    func(s state.State) error { h.saved = s; return nil },
+		Probes: []probe.Group{{}, {}},
+		State:  st,
+		Now:    func() time.Time { return h.now },
+		Save:   func(s state.State) error { h.saved = s; return nil },
 	})
 	h.c.refreshRecord(context.Background(), true)
 	return h
@@ -356,5 +362,73 @@ func TestDurFA(t *testing.T) {
 	}
 	if got := durFA(2*time.Minute + 5*time.Second); got != "2 دقیقه و 5 ثانیه" {
 		t.Fatal(got)
+	}
+}
+
+func TestPrimaryFromConfig(t *testing.T) {
+	h := newHarnessWith(t, "10.0.0.1", `"primary": "iran2",`, state.State{})
+	if h.c.cfg.Servers[h.c.primary].Name != "iran2" {
+		t.Fatal("primary not taken from config")
+	}
+	// The record is on iran1; iran2 is the primary, so once iran2 has been
+	// clean for failback_after the record moves to it.
+	h.steps(10*6+1, "++")
+	if h.active() != "iran2" {
+		t.Fatalf("expected record on the primary, got %q", h.active())
+	}
+	// And iran1 is now the backup: iran2 failing moves the record to it.
+	h.steps(3, "+-")
+	if h.active() != "iran1" {
+		t.Fatal("expected failover to iran1")
+	}
+	if !h.out.has("سرور مبنا") {
+		t.Fatalf("messages should name the primary: %q", *h.out)
+	}
+}
+
+func TestPrimaryCommand(t *testing.T) {
+	h := newHarness(t, "10.0.0.1")
+	h.steps(3, "++")
+	reply := h.c.Handle(context.Background(), telegram.Command{Name: "primary", Args: []string{"iran2"}})
+	if h.active() != "iran2" || !strings.Contains(reply, "منتقل شد") {
+		t.Fatalf("primary switch: %q", reply)
+	}
+	if h.saved.Primary != "iran2" || h.saved.ConfigPrimary != "iran1" {
+		t.Fatalf("primary not saved: %+v", h.saved)
+	}
+	// No failback to iran1 any more.
+	h.steps(15*6, "++")
+	if h.active() != "iran2" {
+		t.Fatal("must stay on the new primary")
+	}
+	// Unhealthy server: becomes primary, record waits.
+	h.steps(3, "-+")
+	reply = h.c.Handle(context.Background(), telegram.Command{Name: "primary", Args: []string{"iran1"}})
+	if h.active() != "iran2" || !strings.Contains(reply, "قطع") {
+		t.Fatalf("unhealthy primary must not take the record yet: %q", reply)
+	}
+}
+
+func TestPrimaryOverrideSurvivesRestartUntilConfigChanges(t *testing.T) {
+	st := state.State{Primary: "iran2", ConfigPrimary: "iran1"}
+	h := newHarnessWith(t, "10.0.0.2", "", st)
+	if h.c.cfg.Servers[h.c.primary].Name != "iran2" {
+		t.Fatal("bot choice must survive a restart")
+	}
+	h = newHarnessWith(t, "10.0.0.2", `"primary": "iran2",`, state.State{Primary: "iran1", ConfigPrimary: "iran1"})
+	if h.c.cfg.Servers[h.c.primary].Name != "iran2" {
+		t.Fatal("an edited config primary must win over an older bot choice")
+	}
+}
+
+func TestStatusShowsTunnels(t *testing.T) {
+	h := newHarness(t, "10.0.0.1")
+	h.c.tunnels[0] = []probe.Result{{OK: true, RTT: 30 * time.Millisecond}, {Err: errors.New("x")}}
+	h.step("-+")
+	s := h.c.StatusText()
+	for _, want := range []string{"🟢 main (59999)", "🔴 panel (59997)", "⭐️ مبنا"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("status missing %q:\n%s", want, s)
+		}
 	}
 }

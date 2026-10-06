@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -77,5 +78,32 @@ func TestEchoFailsOnSilence(t *testing.T) {
 	defer cancel()
 	if r := (Echo{Addr: ln.Addr().String()}).Probe(ctx); r.OK {
 		t.Fatal("silent peer must fail")
+	}
+}
+
+type fixed Result
+
+func (f fixed) Probe(context.Context) Result { return Result(f) }
+
+func TestGroup(t *testing.T) {
+	ok := fixed{OK: true, RTT: 20 * time.Millisecond}
+	bad := fixed{Err: errors.New("timeout")}
+	g := Group{Members: []Member{{"a", ok}, {"b", bad}, {"c", fixed{OK: true, RTT: 40 * time.Millisecond}}}, RequireAll: true}
+	r, each := g.Run(context.Background())
+	if r.OK || r.Err == nil || r.Err.Error() != "b: timeout" || len(each) != 3 || !each[0].OK || each[1].OK {
+		t.Fatalf("require all: %+v %v", r, each)
+	}
+	g.RequireAll = false
+	r, _ = g.Run(context.Background())
+	if !r.OK || r.RTT != 40*time.Millisecond {
+		t.Fatalf("any: %+v", r)
+	}
+	g.Members = []Member{{"a", bad}, {"b", bad}}
+	if r, _ = g.Run(context.Background()); r.OK {
+		t.Fatal("all failed must fail")
+	}
+	single := Group{Members: []Member{{"only", bad}}, RequireAll: true}
+	if r, _ = single.Run(context.Background()); r.Err.Error() != "timeout" {
+		t.Fatalf("single member error should not be prefixed: %v", r.Err)
 	}
 }

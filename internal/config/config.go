@@ -38,23 +38,37 @@ func (d Duration) MarshalJSON() ([]byte, error) {
 	return json.Marshal(time.Duration(d).String())
 }
 
-// Probe describes how a server's tunnel is checked from the kharej side.
-type Probe struct {
+// Tunnel is one BackPack tunnel between an Iran server and this kharej
+// server, checked through its own probe port.
+type Tunnel struct {
+	// Name is only used in messages, e.g. the BackPack tunnel name.
+	Name string `json:"name"`
+	// Port on the Iran server. For "echo" it must be a forwarded port of this
+	// tunnel that points back at EchoListen on this kharej server.
+	Port int `json:"port"`
 	// Type is "echo" (end-to-end through the tunnel, recommended) or "tcp"
 	// (plain TCP connect to a forwarded port on the Iran server).
-	Type string `json:"type"`
-	// Port on the Iran server. For "echo" it must be a forwarded port of that
-	// server's tunnel that points back at EchoListen on this kharej server.
-	Port int `json:"port"`
+	Type string `json:"type,omitempty"`
 	// Host overrides the address probed; defaults to the server's IP.
 	Host string `json:"host,omitempty"`
 }
 
-// Server is one Iran server, in priority order (the first one is the primary).
+// Probe is the older single-tunnel form of a server's check, still accepted.
+type Probe struct {
+	Type string `json:"type"`
+	Port int    `json:"port"`
+	Host string `json:"host,omitempty"`
+}
+
+// Server is one Iran server.
 type Server struct {
-	Name  string `json:"name"`
-	IP    string `json:"ip"`
-	Probe Probe  `json:"probe"`
+	Name string `json:"name"`
+	IP   string `json:"ip"`
+	// Tunnels are the BackPack tunnels this server carries to this kharej
+	// server; the server is healthy only when every one of them answers
+	// (see Failover.RequireAllTunnels).
+	Tunnels []Tunnel `json:"tunnels,omitempty"`
+	Probe   *Probe   `json:"probe,omitempty"`
 }
 
 type Failover struct {
@@ -72,6 +86,9 @@ type Failover struct {
 	MinHold Duration `json:"min_hold"`
 	// Switch automatically. Can be toggled at runtime from the bot (/auto).
 	Auto *bool `json:"auto,omitempty"`
+	// RequireAllTunnels: a server with several tunnels counts as failed when
+	// any one of them fails (default). false: only when all of them fail.
+	RequireAllTunnels *bool `json:"require_all_tunnels,omitempty"`
 }
 
 type Arvan struct {
@@ -104,15 +121,19 @@ type Telegram struct {
 }
 
 type Config struct {
-	CheckInterval Duration  `json:"check_interval"`
-	ProbeTimeout  Duration  `json:"probe_timeout"`
-	EchoListen    string    `json:"echo_listen"`
-	StateFile     string    `json:"state_file"`
-	Servers       []Server  `json:"servers"`
-	Failover      Failover  `json:"failover"`
-	Arvan         Arvan     `json:"arvan"`
-	DNSVerify     DNSVerify `json:"dns_verify"`
-	Telegram      Telegram  `json:"telegram"`
+	CheckInterval Duration `json:"check_interval"`
+	ProbeTimeout  Duration `json:"probe_timeout"`
+	EchoListen    string   `json:"echo_listen"`
+	StateFile     string   `json:"state_file"`
+	// Primary is the server the domain should normally point at. The record
+	// returns to it after a failover once it has been stable for
+	// Failover.FailbackAfter. Defaults to the first server.
+	Primary   string    `json:"primary,omitempty"`
+	Servers   []Server  `json:"servers"`
+	Failover  Failover  `json:"failover"`
+	Arvan     Arvan     `json:"arvan"`
+	DNSVerify DNSVerify `json:"dns_verify"`
+	Telegram  Telegram  `json:"telegram"`
 }
 
 // Load reads, defaults and validates a config file.
@@ -131,14 +152,15 @@ func Parse(b []byte) (*Config, error) {
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
-	c.applyDefaults()
+	c.ApplyDefaults()
 	if err := c.Validate(); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
 	return &c, nil
 }
 
-func (c *Config) applyDefaults() {
+// ApplyDefaults fills every unset field with its default.
+func (c *Config) ApplyDefaults() {
 	if c.CheckInterval == 0 {
 		c.CheckInterval = Duration(10 * time.Second)
 	}
@@ -152,9 +174,23 @@ func (c *Config) applyDefaults() {
 		c.StateFile = "/var/lib/backpack-plus/state.json"
 	}
 	for i := range c.Servers {
-		if c.Servers[i].Probe.Type == "" {
-			c.Servers[i].Probe.Type = "echo"
+		s := &c.Servers[i]
+		if len(s.Tunnels) == 0 && s.Probe != nil {
+			s.Tunnels = []Tunnel{{Name: "tunnel", Port: s.Probe.Port, Type: s.Probe.Type, Host: s.Probe.Host}}
 		}
+		s.Probe = nil
+		for j := range s.Tunnels {
+			t := &s.Tunnels[j]
+			if t.Type == "" {
+				t.Type = "echo"
+			}
+			if t.Name == "" {
+				t.Name = fmt.Sprintf("port %d", t.Port)
+			}
+		}
+	}
+	if c.Primary == "" && len(c.Servers) > 0 {
+		c.Primary = c.Servers[0].Name
 	}
 	f := &c.Failover
 	if f.FailThreshold == 0 {
@@ -178,6 +214,10 @@ func (c *Config) applyDefaults() {
 	if f.Auto == nil {
 		t := true
 		f.Auto = &t
+	}
+	if f.RequireAllTunnels == nil {
+		t := true
+		f.RequireAllTunnels = &t
 	}
 	if c.Arvan.APIBase == "" {
 		c.Arvan.APIBase = "https://napi.arvancloud.ir/cdn/4.0"
@@ -226,14 +266,28 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("servers[%d] %s: duplicate ip %s", i, s.Name, s.IP))
 		}
 		ips[s.IP] = true
-		switch s.Probe.Type {
-		case "echo", "tcp":
-		default:
-			errs = append(errs, fmt.Errorf("servers[%d] %s: probe.type must be \"echo\" or \"tcp\"", i, s.Name))
+		if len(s.Tunnels) == 0 {
+			errs = append(errs, fmt.Errorf("servers[%d] %s: at least one tunnel (probe port) is required", i, s.Name))
 		}
-		if s.Probe.Port <= 0 || s.Probe.Port > 65535 {
-			errs = append(errs, fmt.Errorf("servers[%d] %s: probe.port is required", i, s.Name))
+		ports := map[string]bool{}
+		for j, t := range s.Tunnels {
+			switch t.Type {
+			case "echo", "tcp":
+			default:
+				errs = append(errs, fmt.Errorf("servers[%d] %s tunnels[%d]: type must be \"echo\" or \"tcp\"", i, s.Name, j))
+			}
+			if t.Port <= 0 || t.Port > 65535 {
+				errs = append(errs, fmt.Errorf("servers[%d] %s tunnels[%d]: port must be 1-65535", i, s.Name, j))
+			}
+			key := t.Host + ":" + fmt.Sprint(t.Port)
+			if ports[key] {
+				errs = append(errs, fmt.Errorf("servers[%d] %s: probe port %d is listed twice; every tunnel needs its own port", i, s.Name, t.Port))
+			}
+			ports[key] = true
 		}
+	}
+	if _, ok := c.ServerByName(c.Primary); !ok && len(c.Servers) > 0 {
+		errs = append(errs, fmt.Errorf("primary %q is not one of the servers", c.Primary))
 	}
 	if c.CheckInterval.D() < time.Second {
 		errs = append(errs, errors.New("check_interval must be at least 1s"))

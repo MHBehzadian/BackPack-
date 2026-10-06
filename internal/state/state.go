@@ -15,6 +15,11 @@ type State struct {
 	LastSwitch time.Time `json:"last_switch"` // when BackPack+ last changed the record
 	Auto       *bool     `json:"auto,omitempty"`
 	Pinned     bool      `json:"pinned"` // manual /switch: no automatic failback until /release
+	// Primary is the primary chosen from the bot (/primary). It applies only
+	// while the config file still names ConfigPrimary; editing the config's
+	// primary wins over an older choice made from the bot.
+	Primary       string `json:"primary,omitempty"`
+	ConfigPrimary string `json:"config_primary,omitempty"`
 }
 
 func Load(path string) (State, error) {

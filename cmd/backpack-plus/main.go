@@ -27,8 +27,10 @@ var version = "dev"
 const usage = `BackPack+ — automatic Iran-server failover for BackPack tunnels
 
 usage:
+  backpack-plus [-config FILE] setup    create or edit the config interactively
   backpack-plus [-config FILE] run      run the monitor (default)
-  backpack-plus [-config FILE] check    validate config, read the record, probe every server, send a test message
+  backpack-plus [-config FILE] check    validate config, read the record, probe every tunnel, send a test message
+  backpack-plus [-config FILE] validate only check that the config file is valid
   backpack-plus version
 `
 
@@ -43,6 +45,14 @@ func main() {
 		fmt.Println("backpack-plus", version)
 		return
 	}
+	if cmd == "setup" {
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		if err := setup(ctx, *cfgPath, os.Stdin, os.Stdout); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		log.Fatal(err)
@@ -55,6 +65,8 @@ func main() {
 		err = run(ctx, cfg)
 	case "check":
 		err = check(ctx, cfg)
+	case "validate":
+		fmt.Printf("%s: OK (primary %s, %d servers, domain %s)\n", *cfgPath, cfg.Primary, len(cfg.Servers), cfg.FQDN())
 	default:
 		flag.Usage()
 		os.Exit(2)
@@ -121,23 +133,27 @@ func (t teeNotifier) Notify(html string) {
 	t.bot.Notify(html)
 }
 
-func build(cfg *config.Config) (*arvanDNS, []probe.Prober, *telegram.Bot, error) {
+func build(cfg *config.Config) (*arvanDNS, []probe.Group, *telegram.Bot, error) {
 	ac, err := arvan.New(cfg.Arvan.APIBase, cfg.Arvan.APIKey, cfg.Arvan.Domain, cfg.Arvan.Proxy)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	dns := &arvanDNS{c: ac, name: cfg.Arvan.Record, id: cfg.Arvan.RecordID}
-	var probers []probe.Prober
+	var groups []probe.Group
 	for _, s := range cfg.Servers {
-		host := s.Probe.Host
-		if host == "" {
-			host = s.IP
+		g := probe.Group{RequireAll: *cfg.Failover.RequireAllTunnels}
+		for _, t := range s.Tunnels {
+			host := t.Host
+			if host == "" {
+				host = s.IP
+			}
+			p, err := probe.New(t.Type, host, t.Port)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("server %s tunnel %s: %w", s.Name, t.Name, err)
+			}
+			g.Members = append(g.Members, probe.Member{Name: t.Name, P: p})
 		}
-		p, err := probe.New(s.Probe.Type, host, s.Probe.Port)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("server %s: %w", s.Name, err)
-		}
-		probers = append(probers, p)
+		groups = append(groups, g)
 	}
 	var bot *telegram.Bot
 	if cfg.Telegram.BotToken != "" {
@@ -146,20 +162,22 @@ func build(cfg *config.Config) (*arvanDNS, []probe.Prober, *telegram.Bot, error)
 			return nil, nil, nil, err
 		}
 	}
-	return dns, probers, bot, nil
+	return dns, groups, bot, nil
 }
 
 func needsEcho(cfg *config.Config) bool {
 	for _, s := range cfg.Servers {
-		if s.Probe.Type == "echo" {
-			return true
+		for _, t := range s.Tunnels {
+			if t.Type == "echo" {
+				return true
+			}
 		}
 	}
 	return false
 }
 
 func run(ctx context.Context, cfg *config.Config) error {
-	dns, probers, bot, err := build(cfg)
+	dns, groups, bot, err := build(cfg)
 	if err != nil {
 		return err
 	}
@@ -186,7 +204,7 @@ func run(ctx context.Context, cfg *config.Config) error {
 		DNS:      dns,
 		Notifier: notifier,
 		Lookup:   dnscheck.Lookup,
-		Probers:  probers,
+		Probes:   groups,
 		State:    st,
 		Save:     func(s state.State) error { return state.Save(cfg.StateFile, s) },
 	})
@@ -209,7 +227,7 @@ func run(ctx context.Context, cfg *config.Config) error {
 }
 
 func check(ctx context.Context, cfg *config.Config) error {
-	dns, probers, bot, err := build(cfg)
+	dns, groups, bot, err := build(cfg)
 	if err != nil {
 		return err
 	}
@@ -246,16 +264,24 @@ func check(ctx context.Context, cfg *config.Config) error {
 		fmt.Printf("arvan: %s -> %v (%s), ttl %d, cdn %v, id %s\n", cfg.FQDN(), rec.IPs, who, rec.TTL, rec.Cloud, dns.id)
 	}
 
-	for i, p := range probers {
+	fmt.Printf("primary: %s\n", cfg.Primary)
+	for i, g := range groups {
 		pctx, cancel := context.WithTimeout(ctx, cfg.ProbeTimeout.D())
-		r := p.Probe(pctx)
+		_, each := g.Run(pctx)
 		cancel()
 		s := cfg.Servers[i]
-		if r.OK {
-			fmt.Printf("probe %s (%s %s:%d): OK in %s\n", s.Name, s.Probe.Type, s.IP, s.Probe.Port, r.RTT.Round(time.Millisecond))
-		} else {
-			ok = false
-			fmt.Printf("probe %s (%s %s:%d): FAILED: %v\n", s.Name, s.Probe.Type, s.IP, s.Probe.Port, r.Err)
+		for j, r := range each {
+			t := s.Tunnels[j]
+			host := t.Host
+			if host == "" {
+				host = s.IP
+			}
+			if r.OK {
+				fmt.Printf("probe %s / %s (%s %s:%d): OK in %s\n", s.Name, t.Name, t.Type, host, t.Port, r.RTT.Round(time.Millisecond))
+			} else {
+				ok = false
+				fmt.Printf("probe %s / %s (%s %s:%d): FAILED: %v\n", s.Name, t.Name, t.Type, host, t.Port, r.Err)
+			}
 		}
 	}
 

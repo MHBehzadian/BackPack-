@@ -1,9 +1,10 @@
 // Package controller decides which Iran server the domain points at.
 //
-// Every server's tunnel is probed continuously. When the server the record
-// points at goes down or keeps dropping, the record is moved to the next
-// healthy server in priority order; when a higher-priority server has been
-// clean for FailbackAfter, the record moves back. Every step is reported.
+// Every tunnel of every server is probed continuously. When the server the
+// record points at goes down or keeps dropping, the record is moved to the
+// next healthy server (the primary first, then the others in config order);
+// when a server ahead of it in that order has been clean for FailbackAfter,
+// the record moves back. Every step is reported.
 //
 // The controller is single-threaded: Run owns all state, and bot commands are
 // handed to it over a channel.
@@ -53,15 +54,17 @@ const recordRefresh = 5 * time.Minute
 const errorRepeat = 15 * time.Minute
 
 type Controller struct {
-	cfg     *config.Config
-	dns     DNS
-	notify  Notifier
-	lookup  LookupFunc
-	probers []probe.Prober
-	now     func() time.Time
-	save    func(state.State) error
+	cfg    *config.Config
+	dns    DNS
+	notify Notifier
+	lookup LookupFunc
+	groups []probe.Group
+	now    func() time.Time
+	save   func(state.State) error
 
 	trackers []*health.Tracker
+	tunnels  [][]probe.Result // last result of every tunnel, per server
+	primary  int
 
 	recordKnown   bool
 	record        RecordInfo
@@ -91,7 +94,7 @@ type Options struct {
 	DNS      DNS
 	Notifier Notifier
 	Lookup   LookupFunc
-	Probers  []probe.Prober // one per server, same order as Config.Servers
+	Probes   []probe.Group // one per server, same order as Config.Servers
 	State    state.State
 	Save     func(state.State) error
 	Now      func() time.Time
@@ -109,7 +112,7 @@ func New(o Options) *Controller {
 		dns:           o.DNS,
 		notify:        o.Notifier,
 		lookup:        o.Lookup,
-		probers:       o.Probers,
+		groups:        o.Probes,
 		now:           o.Now,
 		save:          o.Save,
 		active:        -1,
@@ -125,6 +128,12 @@ func New(o Options) *Controller {
 	if i, ok := c.cfg.ServerByName(o.State.Active); ok {
 		c.active = i
 	}
+	c.primary, _ = c.cfg.ServerByName(c.cfg.Primary)
+	if o.State.ConfigPrimary == c.cfg.Primary {
+		if i, ok := c.cfg.ServerByName(o.State.Primary); ok {
+			c.primary = i
+		}
+	}
 	p := health.Params{
 		FailThreshold:    c.cfg.Failover.FailThreshold,
 		RecoverThreshold: c.cfg.Failover.RecoverThreshold,
@@ -132,8 +141,9 @@ func New(o Options) *Controller {
 		FlapMaxDrops:     c.cfg.Failover.FlapMaxDrops,
 	}
 	now := c.now()
-	for range c.cfg.Servers {
+	for _, s := range c.cfg.Servers {
 		c.trackers = append(c.trackers, health.NewTracker(p, now))
+		c.tunnels = append(c.tunnels, make([]probe.Result, len(s.Tunnels)))
 	}
 	return c
 }
@@ -168,15 +178,15 @@ func (c *Controller) Tick(ctx context.Context) {
 }
 
 func (c *Controller) probeAll(ctx context.Context) []probe.Result {
-	res := make([]probe.Result, len(c.probers))
+	res := make([]probe.Result, len(c.groups))
 	var wg sync.WaitGroup
-	for i, p := range c.probers {
+	for i, g := range c.groups {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			pctx, cancel := context.WithTimeout(ctx, c.cfg.ProbeTimeout.D())
 			defer cancel()
-			res[i] = p.Probe(pctx)
+			res[i], c.tunnels[i] = g.Run(pctx)
 		}()
 	}
 	wg.Wait()
@@ -252,24 +262,63 @@ func (c *Controller) Decide(ctx context.Context) {
 		return
 	}
 
-	// Failback: a higher-priority server that has been clean long enough.
+	// Failback: a server ahead of the active one that has been clean long enough.
 	if !c.auto || c.pinned || now.Sub(c.lastSwitch) < f.MinHold.D() {
 		return
 	}
-	for i := 0; i < c.active; i++ {
+	for _, i := range c.order() {
+		if i == c.active {
+			break
+		}
 		tr := c.trackers[i]
 		if tr.Status() == health.Up && tr.CleanFor(now) >= f.FailbackAfter.D() {
-			c.switchTo(ctx, i, fmt.Sprintf("سرور <b>%s</b> (اولویت بالاتر) %s بدون قطعی پایدار بوده؛ برگشت به آن",
-				esc(c.cfg.Servers[i].Name), durFA(tr.CleanFor(now).Round(time.Second))))
+			c.switchTo(ctx, i, fmt.Sprintf("سرور <b>%s</b> (%s) %s بدون قطعی پایدار بوده؛ برگشت به آن",
+				esc(c.cfg.Servers[i].Name), c.roleWord(i), durFA(tr.CleanFor(now).Round(time.Second))))
 			return
 		}
 	}
 }
 
+// order is the server indexes in priority order: the primary, then the rest
+// in config order.
+func (c *Controller) order() []int {
+	o := []int{c.primary}
+	for i := range c.cfg.Servers {
+		if i != c.primary {
+			o = append(o, i)
+		}
+	}
+	return o
+}
+
+// ahead reports whether server a comes before server b in priority order.
+func (c *Controller) ahead(a, b int) bool {
+	if b < 0 {
+		return true
+	}
+	for _, i := range c.order() {
+		if i == a {
+			return a != b
+		}
+		if i == b {
+			return false
+		}
+	}
+	return false
+}
+
+// roleWord names a server's place in the order for messages.
+func (c *Controller) roleWord(i int) string {
+	if i == c.primary {
+		return "سرور مبنا"
+	}
+	return "اولویت بالاتر"
+}
+
 // bestUsable is the highest-priority Up server other than skip, or -1.
 func (c *Controller) bestUsable(skip int) int {
-	for i, tr := range c.trackers {
-		if i != skip && tr.Status().Usable() {
+	for _, i := range c.order() {
+		if i != skip && c.trackers[i].Status().Usable() {
 			return i
 		}
 	}
@@ -279,7 +328,8 @@ func (c *Controller) bestUsable(skip int) int {
 // bestAnswering is the highest-priority Unstable server whose last probe
 // succeeded, or -1.
 func (c *Controller) bestAnswering(skip int) int {
-	for i, tr := range c.trackers {
+	for _, i := range c.order() {
+		tr := c.trackers[i]
 		if i != skip && tr.Status() == health.Unstable && tr.LastErr == nil {
 			return i
 		}
@@ -313,7 +363,7 @@ func (c *Controller) switchTo(ctx context.Context, target int, why string) {
 	c.lastRecordAt = now
 	c.active = target
 	c.lastSwitch = now
-	if target == 0 {
+	if target == c.primary {
 		c.pinned = false
 	}
 	c.persist()
@@ -431,7 +481,8 @@ func (c *Controller) refreshRecord(ctx context.Context, startup bool) {
 }
 
 func (c *Controller) persist() {
-	s := state.State{LastSwitch: c.lastSwitch, Pinned: c.pinned}
+	s := state.State{LastSwitch: c.lastSwitch, Pinned: c.pinned,
+		Primary: c.cfg.Servers[c.primary].Name, ConfigPrimary: c.cfg.Primary}
 	auto := c.auto
 	s.Auto = &auto
 	if c.active >= 0 {
@@ -463,12 +514,14 @@ func (c *Controller) announceStart() {
 			fmt.Fprintf(&b, "الان پشت دامین: <code>%s</code> (ناشناس)\n", esc(strings.Join(c.record.IPs, ", ")))
 		}
 	}
-	b.WriteString("سرورها به ترتیب اولویت: ")
-	for i, s := range c.cfg.Servers {
-		if i > 0 {
-			b.WriteString(" ← ")
+	fmt.Fprintf(&b, "سرور مبنا: <b>%s</b>\n", esc(c.cfg.Servers[c.primary].Name))
+	b.WriteString("ترتیب: ")
+	for n, i := range c.order() {
+		if n > 0 {
+			b.WriteString("، بعد ")
 		}
-		b.WriteString(esc(s.Name))
+		s := c.cfg.Servers[i]
+		fmt.Fprintf(&b, "%s (%d تانل)", esc(s.Name), len(s.Tunnels))
 	}
 	fmt.Fprintf(&b, "\nحالت خودکار: %s", onOff(c.auto))
 	c.notify.Notify(b.String())
@@ -500,7 +553,7 @@ func (c *Controller) announceStatus(i int, old, cur health.Status) {
 			return // first good probes after start; covered by the startup message
 		}
 		msg = fmt.Sprintf("🟢 تانل سرور <b>%s</b>%s دوباره وصل شد (RTT %s).", name, role, tr.LastRTT.Round(time.Millisecond))
-		if c.active > i {
+		if c.ahead(i, c.active) && c.active >= 0 {
 			if c.auto && !c.pinned {
 				msg += fmt.Sprintf("\nاگر %s بدون قطعی بماند، رکورد را به آن برمی‌گردانم.", durFA(c.cfg.Failover.FailbackAfter.D()))
 			} else {
@@ -559,7 +612,37 @@ func (c *Controller) Handle(ctx context.Context, cmd telegram.Command) string {
 	case "release":
 		c.pinned = false
 		c.persist()
-		return "سوییچ دستی آزاد شد؛ برگشت خودکار به سرور اصلی دوباره فعال است."
+		return "سوییچ دستی آزاد شد؛ برگشت خودکار به سرور مبنا دوباره فعال است."
+	case "primary":
+		if len(cmd.Args) == 0 {
+			return fmt.Sprintf("سرور مبنا: <b>%s</b>\nتغییر: <code>/primary نام‌سرور</code>", esc(c.cfg.Servers[c.primary].Name))
+		}
+		i, ok := c.cfg.ServerByName(cmd.Args[0])
+		if !ok {
+			return "سروری با این نام نیست: " + esc(cmd.Args[0])
+		}
+		if i == c.primary {
+			return "<b>" + esc(c.cfg.Servers[i].Name) + "</b> همین الان سرور مبناست."
+		}
+		c.primary = i
+		c.pinned = false
+		c.persist()
+		name := esc(c.cfg.Servers[i].Name)
+		if i == c.active {
+			return "سرور مبنا شد <b>" + name + "</b> (همین الان هم پشت دامین است)."
+		}
+		if !c.auto {
+			return "سرور مبنا شد <b>" + name + "</b>. حالت خودکار خاموش است؛ برای انتقال رکورد: <code>/switch " + name + "</code>"
+		}
+		if c.trackers[i].Status().Usable() && c.recordKnown {
+			c.switchTo(ctx, i, "سرور مبنا از ربات عوض شد")
+			if c.active == i {
+				return "سرور مبنا شد <b>" + name + "</b> و رکورد به آن منتقل شد."
+			}
+			return "سرور مبنا شد <b>" + name + "</b> ولی تغییر رکورد ناموفق بود؛ دوباره تلاش می‌کنم."
+		}
+		return fmt.Sprintf("سرور مبنا شد <b>%s</b>. الان %s است؛ وقتی %s پایدار بماند رکورد به آن می‌رود.",
+			name, statusFA(c.trackers[i].Status()), durFA(c.cfg.Failover.FailbackAfter.D()))
 	case "switch":
 		if len(cmd.Args) == 0 {
 			return "استفاده: <code>/switch نام‌سرور</code> (برای سرور ناسالم: <code>/switch نام force</code>)"
@@ -581,13 +664,13 @@ func (c *Controller) Handle(ctx context.Context, cmd telegram.Command) string {
 		if i == c.active {
 			return "رکورد همین الان روی <b>" + esc(c.cfg.Servers[i].Name) + "</b> است."
 		}
-		c.pinned = i != 0
+		c.pinned = i != c.primary
 		c.switchTo(ctx, i, "سوییچ دستی از ربات")
 		if c.active != i {
 			return "تغییر رکورد ناموفق بود؛ جزئیات در پیام بالا."
 		}
 		if c.pinned {
-			return "انجام شد. برگشت خودکار به سرور اصلی تا <code>/release</code> متوقف است (اگر این سرور قطع شود، باز هم خودکار جابه‌جا می‌کنم)."
+			return "انجام شد. برگشت خودکار به سرور مبنا تا <code>/release</code> متوقف است (اگر این سرور قطع شود، باز هم خودکار جابه‌جا می‌کنم)."
 		}
 		return "انجام شد."
 	}
@@ -616,18 +699,36 @@ func (c *Controller) StatusText() string {
 		b.WriteString(" — سوییچ دستی (برگشت خودکار متوقف، <code>/release</code>)")
 	}
 	b.WriteString("\n\n")
-	for i, s := range c.cfg.Servers {
+	for _, i := range c.order() {
+		s := c.cfg.Servers[i]
 		tr := c.trackers[i]
 		mark := "▫️"
 		if i == c.active {
 			mark = "👉"
 		}
-		fmt.Fprintf(&b, "%s %s <b>%s</b> <code>%s</code>\n", mark, statusIcon(tr.Status()), esc(s.Name), esc(s.IP))
+		tag := ""
+		if i == c.primary {
+			tag = " ⭐️ مبنا"
+		}
+		fmt.Fprintf(&b, "%s %s <b>%s</b> <code>%s</code>%s\n", mark, statusIcon(tr.Status()), esc(s.Name), esc(s.IP), tag)
 		fmt.Fprintf(&b, "    وضعیت: %s", statusFA(tr.Status()))
 		if tr.Status() == health.Up {
 			fmt.Fprintf(&b, " — RTT %s — پایدار از %s پیش", tr.LastRTT.Round(time.Millisecond), durFA(tr.CleanFor(now).Truncate(time.Second)))
 		}
 		fmt.Fprintf(&b, "\n    قطعی در %s اخیر: %d", durFA(c.cfg.Failover.FlapWindow.D()), tr.DropsInWindow())
+		if len(s.Tunnels) > 1 {
+			for j, t := range s.Tunnels {
+				r := c.tunnels[i][j]
+				switch {
+				case tr.LastCheck.IsZero():
+					fmt.Fprintf(&b, "\n    ⚪️ %s (%d)", esc(t.Name), t.Port)
+				case r.OK:
+					fmt.Fprintf(&b, "\n    🟢 %s (%d) %s", esc(t.Name), t.Port, r.RTT.Round(time.Millisecond))
+				default:
+					fmt.Fprintf(&b, "\n    🔴 %s (%d)", esc(t.Name), t.Port)
+				}
+			}
+		}
 		if tr.LastErr != nil {
 			fmt.Fprintf(&b, "\n    آخرین خطا: <code>%s</code>", esc(tr.LastErr.Error()))
 		}
@@ -643,7 +744,8 @@ func (c *Controller) StatusText() string {
 const helpText = `<b>BackPack+</b> — دستورها:
 /status — وضعیت سرورها و دامین
 /switch نام — انتقال دستی رکورد به یک سرور
-/release — آزاد کردن سوییچ دستی (برگشت خودکار به سرور اصلی)
+/release — آزاد کردن سوییچ دستی (برگشت خودکار به سرور مبنا)
+/primary نام — تعیین سرور مبنا (سروری که دامین در حالت عادی روی آن است)
 /auto on|off — روشن/خاموش کردن جابه‌جایی خودکار`
 
 func esc(s string) string { return telegram.Escape(s) }

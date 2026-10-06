@@ -4,9 +4,24 @@
   "echo_listen": "127.0.0.1:59998",
   "state_file": "/var/lib/backpack-plus/state.json",
 
+  "primary": "iran1",
   "servers": [
-    { "name": "iran1", "ip": "1.2.3.4", "probe": { "type": "echo", "port": 59999 } },
-    { "name": "iran2", "ip": "5.6.7.8", "probe": { "type": "echo", "port": 59999 } }
+    {
+      "name": "iran1",
+      "ip": "1.2.3.4",
+      "tunnels": [
+        { "name": "main", "port": 59999 },
+        { "name": "panel", "port": 59997 }
+      ]
+    },
+    {
+      "name": "iran2",
+      "ip": "5.6.7.8",
+      "tunnels": [
+        { "name": "main", "port": 59999 },
+        { "name": "panel", "port": 59997 }
+      ]
+    }
   ],
 
   "failover": {
@@ -16,7 +31,8 @@
     "flap_max_drops": 3,
     "failback_after": "10m",
     "min_hold": "3m",
-    "auto": true
+    "auto": true,
+    "require_all_tunnels": true
   },
 
   "arvan": {
