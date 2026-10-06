@@ -1,0 +1,18 @@
+[Unit]
+Description=BackPack+ — Iran server failover for BackPack tunnels
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/backpack-plus -config /etc/backpack-plus/config.json run
+Restart=always
+RestartSec=5
+StateDirectory=backpack-plus
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/backpack-plus
+
+[Install]
+WantedBy=multi-user.target

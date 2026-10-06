@@ -1,0 +1,38 @@
+{
+  "check_interval": "10s",
+  "probe_timeout": "5s",
+  "echo_listen": "127.0.0.1:59998",
+  "state_file": "/var/lib/backpack-plus/state.json",
+
+  "servers": [
+    { "name": "iran1", "ip": "1.2.3.4", "probe": { "type": "echo", "port": 59999 } },
+    { "name": "iran2", "ip": "5.6.7.8", "probe": { "type": "echo", "port": 59999 } }
+  ],
+
+  "failover": {
+    "fail_threshold": 3,
+    "recover_threshold": 3,
+    "flap_window": "5m",
+    "flap_max_drops": 3,
+    "failback_after": "10m",
+    "min_hold": "3m",
+    "auto": true
+  },
+
+  "arvan": {
+    "api_key": "Apikey xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "domain": "example.com",
+    "record": "tun"
+  },
+
+  "dns_verify": {
+    "resolvers": ["8.8.8.8", "1.1.1.1", "9.9.9.9"],
+    "interval": "20s",
+    "timeout": "20m"
+  },
+
+  "telegram": {
+    "bot_token": "123456789:AAAA-your-bot-token",
+    "chat_ids": [123456789]
+  }
+}
